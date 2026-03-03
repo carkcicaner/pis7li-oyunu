@@ -14,7 +14,7 @@ html, body {
   overflow-x: hidden;
 }
 
-/* Scrollbar genel görünümü (Tailwind sınıfları desteklemiyorsa yedek olarak) */
+/* Scrollbar genel görünümü */
 ::-webkit-scrollbar {
   height: 6px;
   width: 6px;
