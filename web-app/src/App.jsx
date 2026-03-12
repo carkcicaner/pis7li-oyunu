@@ -13,7 +13,7 @@ import {
   onSnapshot, 
   updateDoc,
   getDoc,
-  runTransaction // YENİ EKLENDİ: Çakışmaları önler
+  runTransaction 
 } from 'firebase/firestore';
 
 // --- Firebase Başlatma ---
@@ -230,6 +230,7 @@ export default function App() {
   const [error, setError] = useState('');
   const [toast, setToast] = useState('');
   const [isMuted, setIsMuted] = useState(false);
+  const [isLoading, setIsLoading] = useState(false); // Butonlara basılmasını geçici engeller
   
   const [pendingJackIndex, setPendingJackIndex] = useState(null);
   const [myHand, setMyHand] = useState([]);
@@ -302,6 +303,7 @@ export default function App() {
     setTimeout(() => setToast(''), 3500);
   };
 
+  // Zaman diliminden bağımsız çalışan bot bekleme süresi
   useEffect(() => {
     if (!room || room.status !== 'playing') return;
     if (room.hostId !== user.uid) return; 
@@ -393,7 +395,7 @@ export default function App() {
           p.roundScore = calculateScore(p.hand) * multiplier;
           p.totalScore += p.roundScore;
         } else {
-          p.roundScore = 0; // Kazanan kesinlikle 0
+          p.roundScore = 0; 
         }
       });
     };
@@ -543,10 +545,14 @@ export default function App() {
     return next;
   };
 
-  // --- KESİN ÇÖZÜM: ODA KURMA İŞLEMİ (TRANSACTION) ---
   const handleCreateRoom = async () => {
-    if (!user || !playerName.trim()) return setError('Lütfen isminizi girin.');
+    const cleanName = playerName.trim();
+    if (!user || !cleanName) return setError('Lütfen isminizi girin.');
+    if (isLoading) return;
+    
+    setIsLoading(true);
     unlockAudio();
+    
     const code = Math.random().toString(36).substring(2, 8).toUpperCase();
     const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', code);
 
@@ -557,7 +563,7 @@ export default function App() {
       betAmount: selectedBet,
       currentRound: 1,
       status: 'waiting', 
-      players: [{ uid: user.uid, name: playerName, avatar: getUniqueAvatar([]), isBot: false, hand: [], cardCount: 0, saidTek: false, roundScore: 0, totalScore: 0 }],
+      players: [{ uid: user.uid, name: cleanName, avatar: getUniqueAvatar([]), isBot: false, hand: [], cardCount: 0, saidTek: false, roundScore: 0, totalScore: 0 }],
       deck: [],
       discard: [],
       turn: 0,
@@ -575,31 +581,36 @@ export default function App() {
       setError('');
     } catch (err) {
       setError('Oda oluşturulamadı.');
+    } finally {
+      setIsLoading(false);
     }
   };
 
-  // --- KESİN ÇÖZÜM: ODAYA KATILMA İŞLEMİ (TRANSACTION) ---
   const handleJoinRoom = async () => {
-    if (!user || !playerName.trim() || !roomCode.trim()) return setError('İsim ve Oda Kodu zorunludur.');
+    const code = roomCode.trim().toUpperCase();
+    const cleanName = playerName.trim();
+    
+    if (!user || !cleanName || !code) return setError('İsim ve Oda Kodu zorunludur.');
+    if (isLoading) return;
+    
+    setIsLoading(true);
     unlockAudio();
-    const code = roomCode.toUpperCase();
     const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', code);
     
     try {
       await runTransaction(db, async (transaction) => {
         const snap = await transaction.get(roomRef);
         if (!snap.exists()) {
-          throw new Error('Oda bulunamadı.');
+          return Promise.reject('Oda bulunamadı veya kod hatalı.');
         }
-        const data = snap.data();
         
-        // Zaten odada mıyız kontrolü
+        const data = snap.data();
         if (data.players.find(p => p.uid === user.uid)) {
-          return;
+          return; 
         }
 
-        if (data.status !== 'waiting') throw new Error('Oyun zaten başlamış.');
-        if (data.players.length >= 7) throw new Error('Oda tam dolu (Max 7).');
+        if (data.status !== 'waiting') return Promise.reject('Oyun zaten başlamış, katılamazsınız.');
+        if (data.players.length >= 7) return Promise.reject('Oda tam dolu (Maksimum 7 kişi).');
 
         const usedAvatars = data.players.map(p => p.avatar);
         const available = EMOJIS.filter(e => !usedAvatars.includes(e));
@@ -607,7 +618,7 @@ export default function App() {
 
         const newPlayer = { 
           uid: user.uid, 
-          name: playerName, 
+          name: cleanName, 
           avatar: newAvatar, 
           isBot: false, 
           hand: [], 
@@ -617,7 +628,6 @@ export default function App() {
           totalScore: 0 
         };
 
-        // Yeni oyuncuyu ekleyerek güncelle (Atomic Update)
         transaction.update(roomRef, { players: [...data.players, newPlayer] });
       });
 
@@ -625,13 +635,15 @@ export default function App() {
       setError('');
     } catch (err) {
       console.error(err);
-      setError(err.message || 'Odaya katılırken hata oluştu.');
+      setError(typeof err === 'string' ? err : 'Odaya katılırken hata oluştu.');
+    } finally {
+      setIsLoading(false);
     }
   };
 
-  // --- KESİN ÇÖZÜM: BOT EKLEME İŞLEMİ (TRANSACTION) ---
   const handleAddBot = async () => {
-    if (!room || room.hostId !== user.uid || room.players.length >= 7) return;
+    if (!room || room.hostId !== user.uid || room.players.length >= 7 || isLoading) return;
+    setIsLoading(true);
     const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomCode);
     
     try {
@@ -663,13 +675,16 @@ export default function App() {
       });
     } catch (err) {
       console.error("Bot ekleme hatası:", err);
+    } finally {
+      setIsLoading(false);
     }
   };
 
-  // --- KESİN ÇÖZÜM: OYUN BAŞLATMA İŞLEMİ (TRANSACTION) ---
   const startRound = async () => {
-    if (room.hostId !== user.uid) return;
+    if (room.hostId !== user.uid || isLoading) return;
     if (room.players.length < 2) return setError('En az 2 oyuncu gerekiyor.'); 
+    
+    setIsLoading(true);
     const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomCode);
 
     try {
@@ -702,12 +717,13 @@ export default function App() {
           pendingDraw: 0,
           cardsPlayedThisRound: 0,
           hasDrawn: false,
-          winner: null,
-          turnUpdatedAt: Date.now()
+          winner: null
         });
       });
     } catch (err) {
        setError(err.message || "Oyun başlatılırken hata oluştu");
+    } finally {
+       setIsLoading(false);
     }
   };
 
@@ -761,9 +777,10 @@ export default function App() {
             
             <button 
               onClick={handleCreateRoom}
-              className="w-full bg-gradient-to-r from-emerald-500 to-teal-400 hover:from-emerald-400 hover:to-teal-300 text-slate-900 font-black py-3 md:py-4 rounded-2xl mb-4 shadow-lg transition-transform hover:scale-[1.02] active:scale-95 text-base md:text-lg"
+              disabled={isLoading}
+              className={`w-full bg-gradient-to-r from-emerald-500 to-teal-400 text-slate-900 font-black py-3 md:py-4 rounded-2xl mb-4 shadow-lg transition-transform ${isLoading ? 'opacity-50 cursor-not-allowed' : 'hover:from-emerald-400 hover:to-teal-300 hover:scale-[1.02] active:scale-95'} text-base md:text-lg`}
             >
-              YENİ ODA KUR
+              {isLoading ? 'BEKLEYİN...' : 'YENİ ODA KUR'}
             </button>
             
             <div className="relative flex py-2 items-center mb-4">
@@ -783,9 +800,10 @@ export default function App() {
                />
                <button 
                  onClick={handleJoinRoom}
-                 className="flex-shrink-0 bg-blue-600 hover:bg-blue-500 text-white font-bold px-6 sm:px-8 rounded-2xl shadow-lg transition-transform hover:scale-[1.02] active:scale-95"
+                 disabled={isLoading}
+                 className={`flex-shrink-0 bg-blue-600 text-white font-bold px-6 sm:px-8 rounded-2xl shadow-lg transition-transform ${isLoading ? 'opacity-50 cursor-not-allowed' : 'hover:bg-blue-500 hover:scale-[1.02] active:scale-95'}`}
                >
-                 GİR
+                 {isLoading ? '...' : 'GİR'}
                </button>
             </div>
           </div>
@@ -808,7 +826,7 @@ export default function App() {
               <div className="flex flex-col sm:flex-row justify-between items-start sm:items-end border-b border-white/10 pb-2 mb-4 gap-2">
                  <h3 className="text-white/60 font-bold uppercase tracking-wider text-xs sm:text-sm">Oyuncular ({room.players.length}/7)</h3>
                  {room.hostId === user.uid && room.players.length < 7 && (
-                   <button onClick={handleAddBot} className="text-[10px] sm:text-xs bg-purple-600/80 hover:bg-purple-500 text-white px-2 sm:px-3 py-1.5 rounded-lg font-bold transition-all border border-purple-400/50">+ YAPAY ZEKA EKLE</button>
+                   <button onClick={handleAddBot} disabled={isLoading} className="text-[10px] sm:text-xs bg-purple-600/80 hover:bg-purple-500 text-white px-2 sm:px-3 py-1.5 rounded-lg font-bold transition-all border border-purple-400/50 disabled:opacity-50">+ YAPAY ZEKA EKLE</button>
                  )}
               </div>
               <ul className="space-y-2 sm:space-y-3 max-h-[40vh] overflow-y-auto pr-2 custom-scrollbar">
@@ -828,10 +846,10 @@ export default function App() {
             {room.hostId === user.uid ? (
               <button 
                 onClick={startRound}
-                disabled={room.players.length < 2} 
-                className={`w-full font-black text-base sm:text-lg py-4 sm:py-5 rounded-2xl shadow-[0_10px_30px_rgba(0,0,0,0.3)] transition-all ${room.players.length >= 2 ? 'bg-gradient-to-r from-emerald-500 to-teal-400 text-slate-900 hover:scale-[1.02] active:scale-95' : 'bg-slate-800 text-slate-500 cursor-not-allowed'}`}
+                disabled={room.players.length < 2 || isLoading} 
+                className={`w-full font-black text-base sm:text-lg py-4 sm:py-5 rounded-2xl shadow-[0_10px_30px_rgba(0,0,0,0.3)] transition-all ${room.players.length >= 2 && !isLoading ? 'bg-gradient-to-r from-emerald-500 to-teal-400 text-slate-900 hover:scale-[1.02] active:scale-95' : 'bg-slate-800 text-slate-500 cursor-not-allowed'}`}
               >
-                {room.players.length < 2 ? 'EN AZ 2 OYUNCU GEREKİYOR' : 'OYUNU BAŞLAT'}
+                {isLoading ? 'BAŞLATILIYOR...' : (room.players.length < 2 ? 'EN AZ 2 OYUNCU GEREKİYOR' : 'OYUNU BAŞLAT')}
               </button>
             ) : (
               <div className="bg-black/30 py-3 sm:py-4 rounded-xl text-emerald-400/80 animate-pulse font-bold tracking-widest text-xs sm:text-sm uppercase">Kurucunun başlatması bekleniyor...</div>
@@ -936,9 +954,17 @@ export default function App() {
 
          {/* Masa Orta Alanı */}
          <div className="flex-1 flex flex-col items-center justify-center relative z-10 my-2 sm:my-4">
-            {isMyTurn && (
+            
+            {/* Üst Uyarı / Sıra Kimde */}
+            {isMyTurn ? (
               <div className="absolute top-10 sm:-top-4 bg-gradient-to-r from-emerald-500 to-teal-400 text-slate-900 font-black text-sm sm:text-2xl md:text-3xl px-6 sm:px-10 py-1.5 sm:py-3 rounded-full shadow-[0_10px_40px_rgba(16,185,129,0.5)] animate-bounce border border-emerald-200/50 z-20 uppercase tracking-widest">
                 SIRA SENDE!
+              </div>
+            ) : (
+              <div className="absolute top-12 sm:-top-4 w-48 sm:w-64 text-center z-20">
+                 <div className="text-white/50 font-bold tracking-widest uppercase text-xs sm:text-sm">
+                    Oynuyor: <span className="text-amber-400">{room.players[room.turn]?.name}</span>
+                 </div>
               </div>
             )}
 
