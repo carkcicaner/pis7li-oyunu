@@ -12,10 +12,11 @@ import {
   setDoc, 
   onSnapshot, 
   updateDoc,
-  getDoc 
+  getDoc,
+  runTransaction // YENİ EKLENDİ: Çakışmaları önler
 } from 'firebase/firestore';
 
-// --- SENİN KENDİ FIREBASE BAĞLANTIN ---
+// --- Firebase Başlatma ---
 const firebaseConfig = {
   apiKey: "AIzaSyCjOh8TB9zK-tDtoBlbyNx60z2OClRJaJQ",
   authDomain: "pis7li-c6803.firebaseapp.com",
@@ -125,12 +126,10 @@ const checkValidPlay = (card, room) => {
   
   const isFirstRound = room.cardsPlayedThisRound < room.players.length;
   
-  // 1. İlk Tur Kuralı: Özel kart yasak ve SADECE SİNEK atılabilir
   if (isFirstRound || room.discard.length === 0) {
     return card.suit === 'sinek' && !isSpecialCard(card);
   }
   
-  // 2. İçeride ceza varsa SADECE aynı ceza kartıyla savuşturulabilir
   if (room.pendingDraw > 0) {
     const topCard = room.discard[room.discard.length - 1];
     if (topCard.rank === '7') return card.rank === '7';
@@ -141,7 +140,6 @@ const checkValidPlay = (card, room) => {
   const topCard = room.discard[room.discard.length - 1];
   if (!topCard) return true;
   
-  // 3. Standart Eşleşmeler
   return card.rank === 'Joker' || 
          card.rank === 'J' || 
          card.suit === room.currentSuit || 
@@ -244,7 +242,6 @@ export default function App() {
   useEffect(() => {
     const initAuth = async () => {
       try {
-        // Just use anonymous auth since custom token might mismatch when moving between environments
         await signInAnonymously(auth);
       } catch (err) {
         console.error("Auth error:", err);
@@ -546,11 +543,13 @@ export default function App() {
     return next;
   };
 
+  // --- KESİN ÇÖZÜM: ODA KURMA İŞLEMİ (TRANSACTION) ---
   const handleCreateRoom = async () => {
     if (!user || !playerName.trim()) return setError('Lütfen isminizi girin.');
     unlockAudio();
     const code = Math.random().toString(36).substring(2, 8).toUpperCase();
-    
+    const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', code);
+
     const newRoom = {
       id: code,
       hostId: user.uid,
@@ -571,13 +570,15 @@ export default function App() {
     };
 
     try {
-      await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'rooms', code), newRoom);
+      await setDoc(roomRef, newRoom);
       setRoomCode(code);
+      setError('');
     } catch (err) {
       setError('Oda oluşturulamadı.');
     }
   };
 
+  // --- KESİN ÇÖZÜM: ODAYA KATILMA İŞLEMİ (TRANSACTION) ---
   const handleJoinRoom = async () => {
     if (!user || !playerName.trim() || !roomCode.trim()) return setError('İsim ve Oda Kodu zorunludur.');
     unlockAudio();
@@ -585,66 +586,129 @@ export default function App() {
     const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', code);
     
     try {
-      const snap = await getDoc(roomRef);
-      if (!snap.exists()) return setError('Oda bulunamadı.');
-      const data = snap.data();
-      
-      if (data.players.find(p => p.uid === user.uid)) {
-        setRoomCode(code); return; 
-      }
+      await runTransaction(db, async (transaction) => {
+        const snap = await transaction.get(roomRef);
+        if (!snap.exists()) {
+          throw new Error('Oda bulunamadı.');
+        }
+        const data = snap.data();
+        
+        // Zaten odada mıyız kontrolü
+        if (data.players.find(p => p.uid === user.uid)) {
+          return;
+        }
 
-      if (data.status !== 'waiting') return setError('Oyun zaten başlamış.');
-      if (data.players.length >= 7) return setError('Oda tam dolu (Max 7).');
+        if (data.status !== 'waiting') throw new Error('Oyun zaten başlamış.');
+        if (data.players.length >= 7) throw new Error('Oda tam dolu (Max 7).');
 
-      const updatedPlayers = [...data.players, { uid: user.uid, name: playerName, avatar: getUniqueAvatar(data.players), isBot: false, hand: [], cardCount: 0, saidTek: false, roundScore: 0, totalScore: 0 }];
-      await updateDoc(roomRef, { players: updatedPlayers });
+        const usedAvatars = data.players.map(p => p.avatar);
+        const available = EMOJIS.filter(e => !usedAvatars.includes(e));
+        const newAvatar = available.length > 0 ? available[Math.floor(Math.random() * available.length)] : '👤';
+
+        const newPlayer = { 
+          uid: user.uid, 
+          name: playerName, 
+          avatar: newAvatar, 
+          isBot: false, 
+          hand: [], 
+          cardCount: 0, 
+          saidTek: false, 
+          roundScore: 0, 
+          totalScore: 0 
+        };
+
+        // Yeni oyuncuyu ekleyerek güncelle (Atomic Update)
+        transaction.update(roomRef, { players: [...data.players, newPlayer] });
+      });
+
       setRoomCode(code);
+      setError('');
     } catch (err) {
-      setError('Odaya katılırken hata oluştu.');
+      console.error(err);
+      setError(err.message || 'Odaya katılırken hata oluştu.');
     }
   };
 
+  // --- KESİN ÇÖZÜM: BOT EKLEME İŞLEMİ (TRANSACTION) ---
   const handleAddBot = async () => {
     if (!room || room.hostId !== user.uid || room.players.length >= 7) return;
-    const botNum = room.players.filter(p => p.isBot).length + 1;
-    const updatedPlayers = [...room.players, { 
-      uid: `bot_${Date.now()}_${botNum}`, 
-      name: `Bot ${botNum}`, 
-      avatar: getUniqueAvatar(room.players),
-      isBot: true, 
-      hand: [], cardCount: 0, saidTek: false, roundScore: 0, totalScore: 0 
-    }];
-    await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomCode), { players: updatedPlayers });
+    const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomCode);
+    
+    try {
+      await runTransaction(db, async (transaction) => {
+        const snap = await transaction.get(roomRef);
+        if (!snap.exists()) return;
+        const data = snap.data();
+        
+        if (data.players.length >= 7) return;
+
+        const botNum = data.players.filter(p => p.isBot).length + 1;
+        const usedAvatars = data.players.map(p => p.avatar);
+        const available = EMOJIS.filter(e => !usedAvatars.includes(e));
+        const newAvatar = available.length > 0 ? available[Math.floor(Math.random() * available.length)] : '🤖';
+
+        const newBot = { 
+          uid: `bot_${Date.now()}_${botNum}`, 
+          name: `Bot ${botNum}`, 
+          avatar: newAvatar,
+          isBot: true, 
+          hand: [], 
+          cardCount: 0, 
+          saidTek: false, 
+          roundScore: 0, 
+          totalScore: 0 
+        };
+
+        transaction.update(roomRef, { players: [...data.players, newBot] });
+      });
+    } catch (err) {
+      console.error("Bot ekleme hatası:", err);
+    }
   };
 
+  // --- KESİN ÇÖZÜM: OYUN BAŞLATMA İŞLEMİ (TRANSACTION) ---
   const startRound = async () => {
     if (room.hostId !== user.uid) return;
     if (room.players.length < 2) return setError('En az 2 oyuncu gerekiyor.'); 
+    const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomCode);
 
-    let deck = generateDeck();
-    let players = room.players.map(p => ({
-       ...p, hand: [], cardCount: 7, saidTek: false, roundScore: 0
-    }));
+    try {
+      await runTransaction(db, async (transaction) => {
+        const snap = await transaction.get(roomRef);
+        if (!snap.exists()) return;
+        const data = snap.data();
 
-    for (let i = 0; i < 7; i++) {
-      for (let p = 0; p < players.length; p++) {
-        players[p].hand.push(deck.pop());
-      }
+        if (data.players.length < 2) throw new Error('En az 2 oyuncu gerekiyor.');
+
+        let deck = generateDeck();
+        let players = data.players.map(p => ({
+           ...p, hand: [], cardCount: 7, saidTek: false, roundScore: 0
+        }));
+
+        for (let i = 0; i < 7; i++) {
+          for (let p = 0; p < players.length; p++) {
+            players[p].hand.push(deck.pop());
+          }
+        }
+
+        transaction.update(roomRef, {
+          status: 'playing',
+          players,
+          deck,
+          discard: [],
+          turn: Math.floor(Math.random() * players.length),
+          direction: 1,
+          currentSuit: '',
+          pendingDraw: 0,
+          cardsPlayedThisRound: 0,
+          hasDrawn: false,
+          winner: null,
+          turnUpdatedAt: Date.now()
+        });
+      });
+    } catch (err) {
+       setError(err.message || "Oyun başlatılırken hata oluştu");
     }
-
-    await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomCode), {
-      status: 'playing',
-      players,
-      deck,
-      discard: [],
-      turn: Math.floor(Math.random() * players.length),
-      direction: 1,
-      currentSuit: '',
-      pendingDraw: 0,
-      cardsPlayedThisRound: 0,
-      hasDrawn: false,
-      winner: null
-    });
   };
 
   const nextRound = async () => {
