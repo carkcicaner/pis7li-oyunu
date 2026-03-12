@@ -222,7 +222,10 @@ const BaseWrapper = ({ children, roomCode, room, playerName, toast, isMuted, set
 export default function App() {
   const [user, setUser] = useState(null);
   const [playerName, setPlayerName] = useState('');
-  const [roomCode, setRoomCode] = useState('');
+  // İZLEYİCİ SORUNU ÇÖZÜMÜ: Arama kutusu değeri ile Aktif Odadaki kodu birbirinden ayırdık.
+  const [joinCode, setJoinCode] = useState(''); 
+  const [activeRoomId, setActiveRoomId] = useState(null); 
+  
   const [selectedRounds, setSelectedRounds] = useState(7);
   const [selectedBet, setSelectedBet] = useState(10);
   const [route, setRoute] = useState('landing'); 
@@ -230,7 +233,7 @@ export default function App() {
   const [error, setError] = useState('');
   const [toast, setToast] = useState('');
   const [isMuted, setIsMuted] = useState(false);
-  const [isLoading, setIsLoading] = useState(false); // Butonlara basılmasını geçici engeller
+  const [isLoading, setIsLoading] = useState(false);
   
   const [pendingJackIndex, setPendingJackIndex] = useState(null);
   const [myHand, setMyHand] = useState([]);
@@ -253,10 +256,11 @@ export default function App() {
     return () => unsubscribe();
   }, []);
 
+  // Firebase Odasını Dinleme (Sadece BAŞARIYLA giriş yapıldıysa çalışır)
   useEffect(() => {
-    if (!user || !roomCode) return;
+    if (!user || !activeRoomId) return;
 
-    const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomCode);
+    const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', activeRoomId);
     const unsubscribe = onSnapshot(roomRef, (snapshot) => {
       if (snapshot.exists()) {
         const data = snapshot.data();
@@ -281,7 +285,7 @@ export default function App() {
     });
 
     return () => unsubscribe();
-  }, [user, roomCode]);
+  }, [user, activeRoomId]);
 
   useEffect(() => {
     if (!room || isMuted) return;
@@ -303,7 +307,7 @@ export default function App() {
     setTimeout(() => setToast(''), 3500);
   };
 
-  // Zaman diliminden bağımsız çalışan bot bekleme süresi
+  // Zaman diliminden (Timezone) bağımsız çalışan Olay Bazlı bot bekleme süresi
   useEffect(() => {
     if (!room || room.status !== 'playing') return;
     if (room.hostId !== user.uid) return; 
@@ -357,7 +361,7 @@ export default function App() {
     if (isProcessing.current && actorUid === user.uid) return;
     isProcessing.current = true;
 
-    const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomCode);
+    const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', activeRoomId);
     const snap = await getDoc(roomRef);
     if (!snap.exists()) { isProcessing.current = false; return; }
     let r = snap.data();
@@ -577,7 +581,7 @@ export default function App() {
 
     try {
       await setDoc(roomRef, newRoom);
-      setRoomCode(code);
+      setActiveRoomId(code); // Artık sadece başarıyla kurduktan sonra odaya bağlanır
       setError('');
     } catch (err) {
       setError('Oda oluşturulamadı.');
@@ -587,7 +591,7 @@ export default function App() {
   };
 
   const handleJoinRoom = async () => {
-    const code = roomCode.trim().toUpperCase();
+    const code = joinCode.trim().toUpperCase();
     const cleanName = playerName.trim();
     
     if (!user || !cleanName || !code) return setError('İsim ve Oda Kodu zorunludur.');
@@ -601,7 +605,7 @@ export default function App() {
       await runTransaction(db, async (transaction) => {
         const snap = await transaction.get(roomRef);
         if (!snap.exists()) {
-          return Promise.reject('Oda bulunamadı veya kod hatalı.');
+          throw new Error('Oda bulunamadı veya kod hatalı.');
         }
         
         const data = snap.data();
@@ -609,8 +613,8 @@ export default function App() {
           return; 
         }
 
-        if (data.status !== 'waiting') return Promise.reject('Oyun zaten başlamış, katılamazsınız.');
-        if (data.players.length >= 7) return Promise.reject('Oda tam dolu (Maksimum 7 kişi).');
+        if (data.status !== 'waiting') throw new Error('Oyun zaten başlamış, katılamazsınız.');
+        if (data.players.length >= 7) throw new Error('Oda tam dolu (Maksimum 7 kişi).');
 
         const usedAvatars = data.players.map(p => p.avatar);
         const available = EMOJIS.filter(e => !usedAvatars.includes(e));
@@ -631,11 +635,11 @@ export default function App() {
         transaction.update(roomRef, { players: [...data.players, newPlayer] });
       });
 
-      setRoomCode(code);
+      setActiveRoomId(code); // Artık sadece başarıyla odaya oyuncu olarak eklenince dinlemeye başlar
       setError('');
     } catch (err) {
       console.error(err);
-      setError(typeof err === 'string' ? err : 'Odaya katılırken hata oluştu.');
+      setError(err.message || 'Odaya katılırken hata oluştu.');
     } finally {
       setIsLoading(false);
     }
@@ -644,7 +648,7 @@ export default function App() {
   const handleAddBot = async () => {
     if (!room || room.hostId !== user.uid || room.players.length >= 7 || isLoading) return;
     setIsLoading(true);
-    const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomCode);
+    const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', activeRoomId);
     
     try {
       await runTransaction(db, async (transaction) => {
@@ -685,7 +689,7 @@ export default function App() {
     if (room.players.length < 2) return setError('En az 2 oyuncu gerekiyor.'); 
     
     setIsLoading(true);
-    const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomCode);
+    const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', activeRoomId);
 
     try {
       await runTransaction(db, async (transaction) => {
@@ -730,7 +734,7 @@ export default function App() {
   const nextRound = async () => {
      if (room.hostId !== user.uid) return;
      setViewedPlayer(null); 
-     await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomCode), {
+     await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'rooms', activeRoomId), {
         currentRound: room.currentRound + 1
      });
      startRound();
@@ -742,7 +746,7 @@ export default function App() {
 
   if (route === 'landing') {
     return (
-      <BaseWrapper roomCode={roomCode} room={room} playerName={playerName} toast={toast} isMuted={isMuted} setIsMuted={setIsMuted}>
+      <BaseWrapper roomCode={activeRoomId} room={room} playerName={playerName} toast={toast} isMuted={isMuted} setIsMuted={setIsMuted}>
         <div className="flex-1 flex items-center justify-center p-4 sm:p-8 relative">
           <div className="absolute top-1/4 left-1/4 w-96 h-96 bg-emerald-600/20 rounded-full blur-[100px] pointer-events-none"></div>
           <div className="absolute bottom-1/4 right-1/4 w-96 h-96 bg-purple-600/10 rounded-full blur-[100px] pointer-events-none"></div>
@@ -794,8 +798,8 @@ export default function App() {
                  type="text" 
                  placeholder="KOD" 
                  className="flex-1 min-w-0 bg-black/40 border border-white/10 rounded-2xl p-3 md:p-4 text-white text-center font-bold text-lg md:text-xl uppercase tracking-widest focus:outline-none focus:ring-2 focus:ring-blue-500 placeholder:text-white/20 placeholder:tracking-normal"
-                 value={roomCode}
-                 onChange={(e) => setRoomCode(e.target.value.toUpperCase())}
+                 value={joinCode}
+                 onChange={(e) => setJoinCode(e.target.value.toUpperCase())}
                  maxLength={6}
                />
                <button 
@@ -814,7 +818,7 @@ export default function App() {
 
   if (route === 'lobby') {
     return (
-      <BaseWrapper roomCode={roomCode} room={room} playerName={playerName} toast={toast} isMuted={isMuted} setIsMuted={setIsMuted}>
+      <BaseWrapper roomCode={activeRoomId} room={room} playerName={playerName} toast={toast} isMuted={isMuted} setIsMuted={setIsMuted}>
         <div className="flex-1 flex items-center justify-center p-4">
            <div className="bg-white/5 p-6 md:p-10 rounded-[2rem] shadow-2xl backdrop-blur-xl max-w-lg w-full text-center border border-white/10">
             <h2 className="text-xs sm:text-sm font-bold uppercase tracking-widest text-emerald-400 mb-2">Bekleme Odası Kodu</h2>
@@ -905,7 +909,7 @@ export default function App() {
     }
 
     return (
-      <BaseWrapper roomCode={roomCode} room={room} playerName={playerName} toast={toast} isMuted={isMuted} setIsMuted={setIsMuted}>
+      <BaseWrapper roomCode={activeRoomId} room={room} playerName={playerName} toast={toast} isMuted={isMuted} setIsMuted={setIsMuted}>
          <div className="absolute inset-0 opacity-[0.03] pointer-events-none" style={{ backgroundImage: `url("data:image/svg+xml,%3Csvg width='60' height='60' viewBox='0 0 60 60' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M54.627 0l.83.83v58.34h-58.34l-.83-.83L0 54.628l.83-.83h58.34v-58.34l.83.83z' fill='%23ffffff' fill-opacity='1' fill-rule='evenodd'/%3E%3C/svg%3E")` }}></div>
 
          {/* Z-50 Üst Katman Uyarıları (Görünürlük Artırıldı) */}
@@ -1101,7 +1105,7 @@ export default function App() {
     const totalPool = room.betAmount * room.players.length;
 
     return (
-      <BaseWrapper roomCode={roomCode} room={room} playerName={playerName} toast={toast} isMuted={isMuted} setIsMuted={setIsMuted}>
+      <BaseWrapper roomCode={activeRoomId} room={room} playerName={playerName} toast={toast} isMuted={isMuted} setIsMuted={setIsMuted}>
         <div className="flex-1 flex flex-col items-center justify-center p-2 sm:p-4 relative">
           <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[300px] sm:w-[500px] h-[300px] sm:h-[500px] bg-emerald-500/10 rounded-full blur-[80px] sm:blur-[120px] pointer-events-none"></div>
           
@@ -1163,7 +1167,7 @@ export default function App() {
                
                {isGameOver && (
                  <button 
-                   onClick={() => { setRoute('landing'); setRoom(null); setRoomCode(''); }}
+                   onClick={() => { setRoute('landing'); setRoom(null); setActiveRoomId(null); setJoinCode(''); }}
                    className="bg-emerald-500 hover:bg-emerald-400 text-slate-900 font-black py-3 sm:py-4 px-8 sm:px-12 rounded-xl sm:rounded-2xl shadow-lg transition-transform hover:scale-105 uppercase tracking-widest text-sm sm:text-base w-full sm:w-auto"
                  >
                    Ana Menüye Dön
